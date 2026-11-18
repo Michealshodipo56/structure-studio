@@ -1,9 +1,9 @@
 "use client";
 import { Canvas } from "@react-three/fiber";
 import { OrbitControls, Grid, PerspectiveCamera } from "@react-three/drei";
-import { useMemo } from "react";
+import { useLayoutEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
-import type { Structure } from "@/lib/structure";
+import { isAir, type Structure } from "@/lib/structure";
 function blockColor(name:string) {
   const n=name.toLowerCase();
   if(n.includes("grass")) return "#659947";
@@ -22,11 +22,10 @@ export default function Viewer({structure,layer}:{structure:Structure,layer:numb
   const groups=useMemo(()=>{
     const m=new Map<string,{color:string;positions:number[][]}>();
     for(const b of structure.blocks) {
-      if(b.name.endsWith(":air")||b.name==="air"||(layer!==null&&b.y!==layer)) continue;
+      if(isAir(b.name)||(layer!==null&&b.y!==layer)) continue;
       const color=blockColor(b.name);
-      const key=color;
-      if(!m.has(key)) m.set(key,{color,positions:[]});
-      m.get(key)!.positions.push([b.x-sx/2+0.5,b.y-sy/2+0.5,b.z-sz/2+0.5]);
+      if(!m.has(color)) m.set(color,{color,positions:[]});
+      m.get(color)!.positions.push([b.x-sx/2+0.5,b.y-sy/2+0.5,b.z-sz/2+0.5]);
     }
     return [...m.values()];
   },[structure,layer,sx,sy,sz]);
@@ -41,8 +40,15 @@ export default function Viewer({structure,layer}:{structure:Structure,layer:numb
   </Canvas>;
 }
 function InstancedBlocks({positions,color}:{positions:number[][],color:string}) {
-  const matrices=useMemo(()=>positions.map(p=>new THREE.Matrix4().makeTranslation(p[0],p[1],p[2])),[positions]);
-  return <instancedMesh args={[undefined,undefined,positions.length]} frustumCulled={false} onUpdate={mesh=>{
-    matrices.forEach((m,i)=>mesh.setMatrixAt(i,m));mesh.instanceMatrix.needsUpdate=true;
-  }}><boxGeometry args={[1,1,1]}/><meshLambertMaterial color={color}/></instancedMesh>;
+  const mesh=useRef<THREE.InstancedMesh>(null);
+  useLayoutEffect(()=>{
+    if(!mesh.current) return;
+    const matrix=new THREE.Matrix4();
+    positions.forEach((p,i)=>mesh.current!.setMatrixAt(i,matrix.makeTranslation(p[0],p[1],p[2])));
+    mesh.current.instanceMatrix.needsUpdate=true;
+    mesh.current.computeBoundingSphere();
+  },[positions]);
+  return <instancedMesh ref={mesh} args={[undefined,undefined,positions.length]} frustumCulled={false}>
+    <boxGeometry args={[1,1,1]}/><meshLambertMaterial color={color}/>
+  </instancedMesh>;
 }
