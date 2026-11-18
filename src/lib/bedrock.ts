@@ -1,51 +1,63 @@
 import * as nbt from "prismarine-nbt";
 import { position, volume, type BlockState, type Structure } from "./structure";
-type Tag = { type?: string; value: any };
-function unwrap(tag: any): any {
-  if (tag && typeof tag === "object" && "type" in tag && "value" in tag) return unwrap(tag.value);
-  if (Array.isArray(tag)) return tag.map(unwrap);
-  if (tag && typeof tag === "object") return Object.fromEntries(Object.entries(tag).map(([k,v])=>[k,unwrap(v)]));
-  return tag;
+
+function intArray(value: unknown, label: string): number[] {
+  // Prismarine-NBT's simplify returns int arrays as arrays; older representations
+  // may wrap the numbers in a {value: number[]} object.
+  const numbers = Array.isArray(value) ? value :
+    value && typeof value === "object" && "value" in value && Array.isArray(value.value) ? value.value : null;
+  if (!numbers || !numbers.every((n: unknown) => typeof n === "number" && Number.isSafeInteger(n)))
+    throw new Error(`Invalid ${label}: expected an integer array`);
+  return numbers;
 }
-function intArray(tag: any): number[] {
-  const value = unwrap(tag);
-  if (Array.isArray(value)) return value.map(Number);
-  if (value && Array.isArray(value.value)) return value.value.map(Number);
-  throw new Error("Invalid NBT integer array");
-}
+
 export async function parseMcstructure(buffer: ArrayBuffer): Promise<Structure> {
+  if (!buffer.byteLength) throw new Error("Empty structure file");
   if (buffer.byteLength > 128 * 1024 * 1024) throw new Error("File exceeds 128 MiB import limit");
-  // Bedrock structure files are little-endian, uncompressed NBT.
-  const parsed = await nbt.parse(Buffer.from(buffer), "little");
-  const root = (parsed as any).parsed;
-  const data = unwrap(root);
-  if (!data?.size || !data?.structure?.block_indices || !data?.structure?.palette?.default?.block_palette)
-    throw new Error("Not a valid Bedrock .mcstructure file");
-  const dimensions = intArray(data.size);
-  if (dimensions.length !== 3) throw new Error("Invalid dimensions");
-  const size = dimensions as [number,number,number];
+  // Bedrock .mcstructure is little-endian NBT, unlike Java structure templates.
+  const { parsed } = await nbt.parse(buffer, "little");
+  const data = nbt.simplify(parsed);
+  if (!data || typeof data !== "object") throw new Error("Invalid Bedrock NBT root");
+  if (data.compression === 1) throw new Error("Compressed Bedrock v2 structures are not supported yet");
+  const dimensions = intArray(data.size, "size");
+  if (dimensions.length !== 3) throw new Error("Invalid structure dimensions");
+  const size: [number, number, number] = [dimensions[0], dimensions[1], dimensions[2]];
   const count = volume(size);
-  const layers = data.structure.block_indices.map((v: any)=>intArray(v));
-  if (layers.length !== 2 || layers.some((v: number[])=>v.length !== count))
-    throw new Error("Invalid block index layers");
-  const palette: any[] = data.structure.palette.default.block_palette;
-  if (!Array.isArray(palette) || palette.length > 65536) throw new Error("Invalid block palette");
+  const structure = data.structure;
+  const palette = structure?.palette?.default?.block_palette;
+  if (!Array.isArray(palette) || palette.length > 65536) throw new Error("Invalid or missing block palette");
+  const rawLayers = structure?.block_indices;
+  if (!Array.isArray(rawLayers) || rawLayers.length < 1 || rawLayers.length > 2)
+    throw new Error("Expected one or two block index layers");
+  const layers = rawLayers.map((v: unknown, index: number) => intArray(v, `block layer ${index}`));
+  if (layers.some((v: number[]) => v.length !== count))
+    throw new Error("Block index array length does not match dimensions");
   const blocks: Structure["blocks"] = [];
-  const warnings: string[] = [];
   for (let layer = 0; layer < layers.length; layer++) {
-    for (let i=0; i<count; i++) {
+    for (let i = 0; i < count; i++) {
       const paletteIndex = layers[layer][i];
-      if (paletteIndex === -1) continue;
-      if (!Number.isInteger(paletteIndex) || paletteIndex < 0 || paletteIndex >= palette.length)
-        throw new Error(`Invalid palette index at position ${i}`);
+      if (paletteIndex === -1) continue; // unchanged / absent, not air
+      if (paletteIndex < 0 || paletteIndex >= palette.length)
+        throw new Error(`Invalid palette index ${paletteIndex} at position ${i}`);
       const entry = palette[paletteIndex];
-      if (typeof entry?.name !== "string") throw new Error("Palette entry has no block name");
-      const [x,y,z] = position(i,size);
-      blocks.push({x,y,z,name:entry.name,states:(entry.states ?? {}) as BlockState,layer});
+      if (!entry || typeof entry.name !== "string" || !entry.name.trim())
+        throw new Error(`Invalid block palette entry ${paletteIndex}`);
+      const [x, y, z] = position(i, size);
+      const states: BlockState = {};
+      if (entry.states && typeof entry.states === "object" && !Array.isArray(entry.states)) {
+        for (const [key, value] of Object.entries(entry.states)) {
+          if (typeof value === "string" || typeof value === "boolean" ||
+              (typeof value === "number" && Number.isFinite(value))) states[key] = value;
+        }
+      }
+      blocks.push({ x, y, z, name: entry.name, states, layer });
     }
   }
-  if (data.structure.palette.default.block_position_data && Object.keys(data.structure.palette.default.block_position_data).length)
-    warnings.push("Block entity data exists but is not yet preserved by this viewer.");
-  warnings.push("Complex block shapes and orientations are not yet rendered accurately.");
-  return {format:"mcstructure",size,blocks,warnings};
+  const warnings = ["Preview uses approximate block geometry and colors, not official Minecraft textures."];
+  const positionData = structure?.palette?.default?.block_position_data;
+  if (positionData && Object.keys(positionData).length)
+    warnings.push("Block entity NBT is present but is not yet preserved.");
+  if (Array.isArray(structure?.entities) && structure.entities.length)
+    warnings.push("Entity NBT is present but is not yet preserved.");
+  return { format: "mcstructure", size, blocks, warnings };
 }
